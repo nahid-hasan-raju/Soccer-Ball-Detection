@@ -18,11 +18,17 @@ class BallDetectionCNN(nn.Module):
             nn.Conv2d(3, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
             nn.MaxPool2d(2)
         )
         
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2)
@@ -32,6 +38,9 @@ class BallDetectionCNN(nn.Module):
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
             nn.MaxPool2d(2)
         )
         
@@ -39,12 +48,18 @@ class BallDetectionCNN(nn.Module):
             nn.Conv2d(128, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
             nn.MaxPool2d(2)
         )
         
         self.conv5 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(),
             nn.MaxPool2d(2)
         )
@@ -52,12 +67,13 @@ class BallDetectionCNN(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         
         self.fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 4)
+            nn.Linear(128, 4)
         )
     
     def forward(self, x):
@@ -114,15 +130,36 @@ def get_transform(training=True):
     if training:
         return transforms.Compose([
             transforms.ToPILImage(),
-            transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+            transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
     else:
         return transforms.Compose([
             transforms.ToPILImage(),
             transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
+
+
+def iou_loss(pred, target):
+    pred_x1, pred_y1, pred_x2, pred_y2 = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    tgt_x1, tgt_y1, tgt_x2, tgt_y2 = target[:, 0], target[:, 1], target[:, 2], target[:, 3]
+    
+    inter_x1 = torch.max(pred_x1, tgt_x1)
+    inter_y1 = torch.max(pred_y1, tgt_y1)
+    inter_x2 = torch.min(pred_x2, tgt_x2)
+    inter_y2 = torch.min(pred_y2, tgt_y2)
+    
+    inter = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    
+    pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+    tgt_area = (tgt_x2 - tgt_x1) * (tgt_y2 - tgt_y1)
+    union = pred_area + tgt_area - inter
+    
+    iou = inter / (union + 1e-6)
+    return (1 - iou).mean()
 
 
 def calculate_iou(pred, target):
@@ -146,20 +183,17 @@ def calculate_iou(pred, target):
 def train_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0
-    criterion = nn.MSELoss()
+    mse = nn.MSELoss()
     
     for imgs, targets in tqdm(loader, desc='Training'):
         imgs = imgs.to(device)
         targets = targets.to(device)
         
         preds = model(imgs)
-        preds = torch.clamp(preds, 0, 1)
-        
-        loss = criterion(preds, targets)
+        loss = 0.5 * mse(preds, targets) + 0.5 * iou_loss(preds, targets)
         
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         total_loss += loss.item()
@@ -171,7 +205,7 @@ def validate(model, loader, device):
     model.eval()
     total_loss = 0
     ious = []
-    criterion = nn.MSELoss()
+    mse = nn.MSELoss()
     
     with torch.no_grad():
         for imgs, targets in tqdm(loader, desc='Validating'):
@@ -179,9 +213,7 @@ def validate(model, loader, device):
             targets = targets.to(device)
             
             preds = model(imgs)
-            preds = torch.clamp(preds, 0, 1)
-            
-            loss = criterion(preds, targets)
+            loss = 0.5 * mse(preds, targets) + 0.5 * iou_loss(preds, targets)
             total_loss += loss.item()
             
             for pred, target in zip(preds, targets):
@@ -195,7 +227,7 @@ def train_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    train_dataset = BallDataset('../Soccerball/train', '../Soccerball/train/_annotations.csv', get_transform(True))
+    train_dataset = BallDataset('Soccerball/train', 'Soccerball/train/_annotations.csv', get_transform(True))
     val_size = int(0.15 * len(train_dataset))
     train_size = len(train_dataset) - val_size
     train_set, val_set = torch.utils.data.random_split(train_dataset, [train_size, val_size])
@@ -204,8 +236,8 @@ def train_model():
     val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=4)
     
     model = BallDetectionCNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
     
     os.makedirs('models', exist_ok=True)
     os.makedirs('results', exist_ok=True)
@@ -225,7 +257,7 @@ def train_model():
         
         print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val IoU: {val_iou:.4f}')
         
-        scheduler.step()
+        scheduler.step(val_loss)
         
         if val_iou > best_iou:
             best_iou = val_iou
@@ -250,7 +282,7 @@ def train_model():
 def test_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    test_dataset = BallDataset('../Soccerball/test', '../Soccerball/test/_annotations.csv', get_transform(False))
+    test_dataset = BallDataset('Soccerball/test', 'Soccerball/test/_annotations.csv', get_transform(False))
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
     
     model = BallDetectionCNN().to(device)
@@ -265,7 +297,6 @@ def test_model():
         for imgs, targets in tqdm(test_loader, desc='Testing'):
             imgs = imgs.to(device)
             preds = model(imgs).cpu()
-            preds = torch.clamp(preds, 0, 1)
             
             for i, (pred, target) in enumerate(zip(preds, targets)):
                 iou = calculate_iou(pred, target)
@@ -301,7 +332,7 @@ def predict_image(img_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = BallDetectionCNN().to(device)
-    checkpoint = torch.load('models/best_model.pth', map_location=device)
+    checkpoint = torch.load('models/best_model.pth', map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model'])
     model.eval()
     
@@ -314,8 +345,7 @@ def predict_image(img_path):
     img_tensor = transform(img_resized).unsqueeze(0).to(device)
     
     with torch.no_grad():
-        pred = model(img_tensor)[0].cpu()
-        pred = torch.clamp(pred, 0, 1).numpy()
+        pred = model(img_tensor)[0].cpu().numpy()
     
     xmin = int(pred[0] * w)
     ymin = int(pred[1] * h)
